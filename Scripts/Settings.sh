@@ -458,18 +458,35 @@ fi
 # 覆盖它不影响其它逻辑。
 # 注：sed 用 [[:space:]] 而非 \s —— 构建机上可能是 busybox sed，不支持 \s。
 # -------------------------------------------------------
-LUCI_RUNTIME="./feeds/luci/modules/luci-base/ucode/runtime.uc"
-if [ -f "$LUCI_RUNTIME" ]; then
+# 用 find 定位而非硬编码路径：feeds 内 luci-base 的层级属上游结构，
+# immortalwrt 若调整模块位置（modules/ → 其它），硬编码会失效。
+#
+# 两个必须注意的点：
+#  ① 带路径限定：runtime.uc / luci 都是通用文件名，feeds 里可能有同名文件
+#     （如某个 app 的 ucode/ 下也有 runtime.uc）。不加限定会改错文件 ——
+#     断言通过但功能没生效，是最难查的一类问题。
+#  ② 分隔符容错：`find -path` 的模式匹配依赖路径分隔符，而该分隔符随平台变化
+#     （Linux 是 /，Windows/MSYS 下 find 输出 \）。实测 `-path '*/luci-base/*'`
+#     在这种环境下匹配为空。故改为「find -name 取全部候选 → grep 用 [/\\]
+#     按路径段过滤」，两种分隔符都能命中，本地与 CI 行为一致。
+# 只扫 ./feeds/luci（feeds 的 git clone 本体；package/feeds/ 下只是指向它的
+# 符号链接，find 默认不跟随，扫它会漏）。
+find_in_feed() {	# $1=grep -E 的路径段模式 $2=文件名
+	find ./feeds/luci -type f -name "$2" 2>/dev/null | grep -E "$1" | head -1
+}
+
+LUCI_RUNTIME=$(find_in_feed 'luci-base[/\\]ucode[/\\]' 'runtime.uc')
+if [ -n "$LUCI_RUNTIME" ]; then
 	BUILD_EPOCH=$(date +%s)
 	sed -i "s|^\([[:space:]]*\)self\.env\.pkgs_update_time = .*|\1self.env.pkgs_update_time = $BUILD_EPOCH;|" "$LUCI_RUNTIME"
 	if grep -q "pkgs_update_time = $BUILD_EPOCH;" "$LUCI_RUNTIME"; then
 		echo "RivWRT: LuCI 资源版本号已绑定构建时刻 ($BUILD_EPOCH)"
 	else
-		echo "RivWRT: ERROR - LuCI 资源版本号改写失败（runtime.uc 结构变了？）" >&2
+		echo "RivWRT: ERROR - 资源版本号改写未命中 $LUCI_RUNTIME（runtime.uc 结构变了？）" >&2
 		exit 1
 	fi
 else
-	echo "RivWRT: ERROR - 未找到 $LUCI_RUNTIME（feeds 结构变了？）" >&2
+	echo "RivWRT: ERROR - 未在 ./feeds/luci 下找到 luci-base/ucode/runtime.uc（feeds 结构变了？）" >&2
 	exit 1
 fi
 
@@ -498,17 +515,17 @@ fi
 # 形态（lan 用 ports 数组、wan/wan2 各用 device），避免同一端口既出现在某角色的
 # ports 里、又作为独立角色出现而重复显示。
 # -------------------------------------------------------
-LUCI_RPCD_PLUGIN="./feeds/luci/modules/luci-base/root/usr/share/rpcd/ucode/luci"
-if [ -f "$LUCI_RPCD_PLUGIN" ]; then
+LUCI_RPCD_PLUGIN=$(find_in_feed 'luci-base[/\\]root[/\\]usr[/\\]share[/\\]rpcd[/\\]ucode[/\\]' 'luci')
+if [ -n "$LUCI_RPCD_PLUGIN" ]; then
 	sed -i "s|for (let k in \[ 'lan', 'wan' \])|for (let k in keys(board?.network ?? {}))|" "$LUCI_RPCD_PLUGIN"
 	if grep -qF 'for (let k in keys(board?.network ?? {}))' "$LUCI_RPCD_PLUGIN"; then
 		echo "RivWRT: 端口卡片角色限制已解除（遍历 board.network 全部角色）"
 	else
-		echo "RivWRT: ERROR - 端口卡片补丁未命中（luci 插件结构变了？）" >&2
+		echo "RivWRT: ERROR - 端口卡片补丁未命中 $LUCI_RPCD_PLUGIN（插件结构变了？）" >&2
 		exit 1
 	fi
 else
-	echo "RivWRT: ERROR - 未找到 $LUCI_RPCD_PLUGIN（feeds 结构变了？）" >&2
+	echo "RivWRT: ERROR - 未在 ./feeds/luci 下找到 luci-base 的 rpcd ucode 插件（feeds 结构变了？）" >&2
 	exit 1
 fi
 
