@@ -434,6 +434,46 @@ if grep -rq '\.\./\.\./luci\.mk' ./package/*/Makefile 2>/dev/null; then
 fi
 
 # -------------------------------------------------------
+# RivWRT：让 LuCI 的资源版本号随构建变化（否则浏览器永久复用旧 JS）
+#
+# 现象（实测两次被误导）：镜像里确认已包含新的页面代码，设备上打开的 LuCI 页面
+# 却仍是旧行为 —— 显示早已删除的控件、按钮点了没反应、图表不出数据。
+#
+# 根因链（逐环读源码确认）：
+#   ① LuCI 用 `luci.js?v=<resource_version>` 作为所有前端资源的缓存键
+#      （luci-base/ucode/template/header.ut:10）
+#   ② resource_version = env.pkgs_update_time
+#      （luci-base/ucode/runtime.uc:182）
+#   ③ pkgs_update_time = stat('/usr/lib/opkg/status').mtime
+#   ④ 而 include/rootfs.mk:126 会把整个 rootfs 的文件 mtime 统一 touch 成
+#      SOURCE_DATE_EPOCH：
+#        $(if $(SOURCE_DATE_EPOCH),find $(1)/ -mindepth 1 -execdir touch -hcd "@$(SOURCE_DATE_EPOCH)" "{}" +)
+#   ⑤ SOURCE_DATE_EPOCH 来自源码树的 git 提交时间
+#      （scripts/get_source_date_epoch.sh 的 try_git）。
+#      我们的改动都在【配置仓库】fork，而源码仓库（PurpleRed-River/immortalwrt）
+#      不变 → 该值恒定 → 缓存键恒定 → 浏览器永远复用第一次缓存的 JS。
+#
+# 修法：把 pkgs_update_time 绑定到构建时刻，使每次编译都产生新的资源版本号，
+# 浏览器随即重新拉取。该变量只被 header.ut 的资源 URL 使用（全仓仅此一处引用），
+# 覆盖它不影响其它逻辑。
+# 注：sed 用 [[:space:]] 而非 \s —— 构建机上可能是 busybox sed，不支持 \s。
+# -------------------------------------------------------
+LUCI_RUNTIME="./feeds/luci/modules/luci-base/ucode/runtime.uc"
+if [ -f "$LUCI_RUNTIME" ]; then
+	BUILD_EPOCH=$(date +%s)
+	sed -i "s|^\([[:space:]]*\)self\.env\.pkgs_update_time = .*|\1self.env.pkgs_update_time = $BUILD_EPOCH;|" "$LUCI_RUNTIME"
+	if grep -q "pkgs_update_time = $BUILD_EPOCH;" "$LUCI_RUNTIME"; then
+		echo "RivWRT: LuCI 资源版本号已绑定构建时刻 ($BUILD_EPOCH)"
+	else
+		echo "RivWRT: ERROR - LuCI 资源版本号改写失败（runtime.uc 结构变了？）" >&2
+		exit 1
+	fi
+else
+	echo "RivWRT: ERROR - 未找到 $LUCI_RUNTIME（feeds 结构变了？）" >&2
+	exit 1
+fi
+
+# -------------------------------------------------------
 # uci-defaults：FullCone NAT（IPv4）
 # -------------------------------------------------------
 
@@ -1536,7 +1576,9 @@ START=99
 # ★ marker 名带版本号，本身就是"迁移版本"：每次改动无线固化逻辑就 bump 一次，
 #   让已刷机的设备在下次启动时重跑一遍（否则旧的 marker 会让新逻辑永不执行）。
 #   v1 → v2：补上 disabled 清理（见 start() 第 0 步）。
-MARKER=/etc/.rivwrt-wifi-v2
+#   v2 → v3：就绪判定从 radio 状态改为 AP 接口实际状态（wifi isup 会误判成功，
+#            导致 5G 起不来时脚本毫无动作 —— 真机实测确认）。
+MARKER=/etc/.rivwrt-wifi-v3
 REBOOT_GUARD=/etc/.rivwrt-wifi-rebooted
 
 # 逐 radio 的 upsert（不触发 netifd 全量 reload）
@@ -1549,6 +1591,60 @@ list_radios() {
 	for r in $(uci -q show wireless | sed -n 's/^wireless\.\(radio[0-9]*\)=wifi-device$/\1/p'); do
 		[ "$(uci -q get wireless.$r.disabled)" = "1" ] || echo "$r"
 	done
+}
+
+# ── 无线就绪判定 ──
+# ★ 不能用 `wifi isup <radio>`。读 /sbin/wifi 源码可知 wifi_isup() 只检查
+#   radio 的 up 字段：
+#       json_get_var up up ; [ $up -eq 0 ] && return 1
+#   而真机实测（2026-09-15）三个 radio 全是 up:true，其 AP 接口却是
+#   phy0-ap0 DOWN / phy1-ap0 UP / phy2-ap0 DOWN —— radio 起来了但 hostapd 没把
+#   AP 拉起来（ath11k regd 未生效）。此时 wifi isup 返回【成功】→ 本脚本误判
+#   "一切就绪"→ 不重试、直接落 marker，两个 5G 永远不再尝试。
+#   这就是"5G 一直起不来而脚本毫无动作"的直接原因。
+#
+# 改为判定【AP 接口本身是否真的在广播】：
+#   在该 radio 的 SSID 下找一个已配置该 SSID 的 phy*-ap* 接口。
+#   hostapd 成功配置后 /sys/class/net 才有该接口、且 `iw dev` 才显示 ssid；
+#   起不来时要么接口不存在，要么存在但没有 ssid。
+#
+# 为什么用 SSID 匹配而不是 ubus/jsonfilter 取接口名：后者要依赖 jsonfilter 的
+#   表达式语法（@.radioN.interfaces[*].ifname），而该语法我无法离线验证；
+#   一旦写错会拿到空列表 → 所有 radio 被判"未就绪"→ 反复重启无线。
+#   三个频段 SSID 互不相同（WANT_SSID 已保证），用 SSID 匹配同样精确且零依赖。
+#   接口来源用 /sys/class/net 而非 `ls`，避免依赖 busybox 的 ls applet。
+
+# 该 radio 对应的 iface section
+radio_iface_section() {
+	uci -q show wireless 2>/dev/null | \
+		sed -n "s/^wireless\.\([a-z_0-9]*\)\.device=$1$/\1/p" | head -1
+}
+
+# 是否存在一个正在广播 $1(SSID) 的 AP 接口
+ssid_on_air() {
+	[ -n "$1" ] || return 1
+	for _ifn in $(ls /sys/class/net 2>/dev/null | grep -E '^phy[0-9]+-ap[0-9]+$'); do
+		# 用 awk 精确比较而非 grep 正则：SSID 里含 "."（如 RivWRT-5.2G），
+		# 在正则中 "." 匹配任意字符，会把 RivWRT-512G 之类误判为同一个。
+		# awk 里把 "ssid " 前缀剥掉后整行比较，SSID 含空格也能正确比对。
+		iw dev "$_ifn" info 2>/dev/null | awk -v s="$1" '
+			$1 == "ssid" {
+				sub(/^[[:space:]]*ssid[[:space:]]+/, "")
+				if ($0 == s) found = 1
+			}
+			END { exit !found }
+		' && return 0
+	done
+	return 1
+}
+
+radio_ready() {		# $1=radio：其 AP 是否真的在广播
+	local _sec _ssid
+	_sec=$(radio_iface_section "$1")
+	[ -n "$_sec" ] || return 0	# 没有对应 iface（非 AP 用途）→ 不干预
+	_ssid=$(uci -q get wireless."$_sec".ssid)
+	[ -n "$_ssid" ] || return 1
+	ssid_on_air "$_ssid"
 }
 
 start() {
@@ -1624,10 +1720,10 @@ start() {
 	done
 	[ "$CHANGED" = "1" ] && uci commit wireless
 
-	# ── 找出未起来的 radio ──
+	# ── 找出未起来的 radio（按 AP 接口实际状态判定，见 radio_ready 注释）──
 	NEED=""
 	for RADIO in $(list_radios); do
-		wifi isup "$RADIO" || NEED="$NEED $RADIO"
+		radio_ready "$RADIO" || NEED="$NEED $RADIO"
 	done
 
 	# ── 串行重启（一次一个），避免并发 regd 更新竞争 ──
@@ -1639,17 +1735,19 @@ start() {
 			rw_updown up "$RADIO"
 			i=0
 			while [ $i -lt 10 ]; do
-				wifi isup "$RADIO" && break
+				radio_ready "$RADIO" && break
 				i=$((i+1)); sleep 2
 			done
+			radio_ready "$RADIO" || logger -t rivwrt-wifi "重启后 $RADIO 仍未就绪" 
 		done
 	fi
 
 	# ── 复核：全好则落标记；仍有失败则兜底重启一次 ──
 	STILL=""
 	for RADIO in $(list_radios); do
-		wifi isup "$RADIO" || STILL="$STILL $RADIO"
+		radio_ready "$RADIO" || STILL="$STILL $RADIO"
 	done
+	[ -n "$NEED" ] && logger -t rivwrt-wifi "无线就绪复核：未就绪=[${STILL# }]" 
 
 	if [ -z "$STILL" ]; then
 		rm -f "$REBOOT_GUARD"

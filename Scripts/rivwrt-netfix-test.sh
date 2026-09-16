@@ -23,14 +23,19 @@
 
 set -u
 
-HERE=$(dirname "$0")
+# 路径形态注意：本仓库在 Windows(MSYS) 下开发时，pwd 返回的是【反斜杠】形式
+# 的盘符路径。这种路径若直接用于 shell 中点号加载，反斜杠会被当作转义符 ——
+# 结果是静默失败：不报错、脚本根本没执行，测试却显示"跑过了"。
+# 统一归一化成正斜杠，避免这个坑。
+HERE=$(dirname "$0"); HERE=$(cd "$HERE" && pwd | tr '\\\\' '/')
 SH="$HERE/Settings.sh"
 MOCK="$HERE/.netfix-test.$$"
 CFG="$MOCK/uci.db"
 mkdir -p "$MOCK"
-# 清理临时目录。除常规信号外也覆盖 HUP/PIPE —— 脚本被 head 等截断管道时会收到
-# SIGPIPE，只 trap EXIT 在部分 shell 下不触发，会留下 .netfix-test.$$ 残留目录。
-trap 'rm -rf "$MOCK"' EXIT INT TERM HUP PIPE
+# 清理临时目录。**不要 trap PIPE**：被测脚本内部有产生大量输出的命令，
+# 一旦管子被截断就会收到 SIGPIPE，把 trap 当成退出信号，脚本会中途停止
+# （表现为"测试没跑完、也没有断言输出"，极难察觉）。EXIT 已覆盖正常与中断退出。
+trap 'rm -rf "$MOCK"' EXIT INT TERM HUP
 
 [ -f "$SH" ] || { echo "找不到 $SH"; exit 1; }
 
