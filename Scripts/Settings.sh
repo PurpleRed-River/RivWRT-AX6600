@@ -474,6 +474,45 @@ else
 fi
 
 # -------------------------------------------------------
+# RivWRT：让首页「端口状态」卡片显示全部端口（含 wan2 这类额外上行）
+#
+# 现象：概览页端口卡片只出现 lan 与 wan，wan2 永远不显示 —— 即使 /etc/board.json
+# 里端口信息完全正确。
+#
+# 根因（读 luci-base 的 rpcd ucode 插件）：LuCI 的端口列表来自 ubus
+# `luci.getBuiltinEthernetPorts`，该接口对非 x86/ARM 平台（qualcommax 属此类）
+# 从 /etc/board.json 读端口，但【角色名被硬编码为 lan 与 wan 两个】：
+#         for (let k in [ 'lan', 'wan' ]) {
+#             if (!board?.network?.[k]) continue;
+#             ...
+# 而本固件的 02_network 用 ucidef_set_interface 为第二条上行单独建了 `wan2`
+# 角色（`ucidef_set_interfaces_lan_wan` 只处理 lan/wan 两角色，双 WAN 必须另建）
+# —— 于是 wan2 落在这个硬编码列表之外，永远进不了端口卡片。
+#
+# 改法：把角色列表换成「board.network 的全部角色」，一行改动。
+# 这样 board.json 里有什么角色就显示什么端口，将来再加第三条上行也不必再改。
+# 实测把 board.json 写成 lan / wan / wan2 三角色后，卡片会正确列出 5 个端口
+# （lan1 lan3 lan4 wan1 wan2）—— 与 `ls /sys/class/net` 一致。
+#
+# 配套：uci-defaults 的 98-rivwrt-net-fix 会把 board.json 归一化成同样的三角色
+# 形态（lan 用 ports 数组、wan/wan2 各用 device），避免同一端口既出现在某角色的
+# ports 里、又作为独立角色出现而重复显示。
+# -------------------------------------------------------
+LUCI_RPCD_PLUGIN="./feeds/luci/modules/luci-base/root/usr/share/rpcd/ucode/luci"
+if [ -f "$LUCI_RPCD_PLUGIN" ]; then
+	sed -i "s|for (let k in \[ 'lan', 'wan' \])|for (let k in keys(board?.network ?? {}))|" "$LUCI_RPCD_PLUGIN"
+	if grep -qF 'for (let k in keys(board?.network ?? {}))' "$LUCI_RPCD_PLUGIN"; then
+		echo "RivWRT: 端口卡片角色限制已解除（遍历 board.network 全部角色）"
+	else
+		echo "RivWRT: ERROR - 端口卡片补丁未命中（luci 插件结构变了？）" >&2
+		exit 1
+	fi
+else
+	echo "RivWRT: ERROR - 未找到 $LUCI_RPCD_PLUGIN（feeds 结构变了？）" >&2
+	exit 1
+fi
+
+# -------------------------------------------------------
 # uci-defaults：FullCone NAT（IPv4）
 # -------------------------------------------------------
 
@@ -573,11 +612,14 @@ uci commit network
 # 本脚本跑在 uci-defaults 阶段，此时 network 配置已就绪，故改 board.json
 # 只影响 LuCI 显示，不会动到网络行为。
 #
-# 写法要点：lan 用 ports（对应 br-lan 成员），wan 也用 ports —— LuCI 的取值逻辑是
-#     if (type(board.network[k].ports) == 'array') for (let ifname in ports) push(...)
-# 用数组才能显示多个；且 ucode 的 for..in 对数组返回【元素】而非索引
-# （见 ucode 文档 for (arr in arrays) { push(result, ...arr) }），所以显示的是
-# 端口名本身而不是 0/1/2。
+# 写法要点：角色划分要与 02_network 生成的形态一致 ——
+#   lan  用 ports 数组（br-lan 的多个成员）
+#   wan  用 device（单个上行）
+#   wan2 单独一个角色（第二条上行）
+# 三者互不重叠，配合上面给 luci 插件打的「遍历全部角色」补丁，端口卡片会列出
+# lan1 lan3 lan4 wan1 wan2 五个，正是 `ls /sys/class/net` 看到的全部网口。
+# ★ 不要把 wan2 塞进 wan.ports —— 那样它会既是 wan 的成员、又以独立角色出现，
+#   补丁生效后会在卡片里重复显示两次。
 BOARD_JSON=/etc/board.json
 if [ -f "$BOARD_JSON" ] && command -v ucode >/dev/null 2>&1; then
 	_bj_tmp="${BOARD_JSON}.new"
@@ -588,21 +630,25 @@ if [ -f "$BOARD_JSON" ] && command -v ucode >/dev/null 2>&1; then
 		fd.close();
 		b.network = b.network || {};
 		b.network.lan = { "protocol": "static", "ports": [ "lan1", "lan3", "lan4" ] };
-		b.network.wan = { "protocol": "dhcp", "ports": [ "wan1", "wan2" ] };
+		b.network.wan = { "protocol": "dhcp", "device": "wan1" };
+		b.network.wan2 = { "protocol": "none", "device": "wan2" };
 		printf("%J", b);
 	' > "$_bj_tmp" 2>/dev/null && [ -s "$_bj_tmp" ]; then
-		# 落盘前校验：必须是合法 JSON，且含预期端口（防止半截写入把 board.json 弄坏）
+		# 落盘前校验：必须是合法 JSON，且三个角色都符合预期（防止半截写入把
+		# board.json 弄坏 —— 它还被 LuCI 的其它页面读取）。
 		if ucode -e '
 			let fd = open("/etc/board.json.new", "r");
 			if (!fd) exit(1);
 			let b = json(fd);
 			fd.close();
-			let w = b?.network?.wan?.ports, l = b?.network?.lan?.ports;
-			exit((type(w) == "array" && index(w, "wan2") != -1
-			      && type(l) == "array" && index(l, "lan1") != -1) ? 0 : 1);
+			let l = b?.network?.lan?.ports,
+			    w = b?.network?.wan?.device,
+			    w2 = b?.network?.wan2?.device;
+			exit((type(l) == "array" && index(l, "lan1") != -1
+			      && w == "wan1" && w2 == "wan2") ? 0 : 1);
 		' 2>/dev/null; then
 			mv -f "$_bj_tmp" "$BOARD_JSON"
-			echo "RivWRT: board.json 端口信息已更新（lan1 lan3 lan4 / wan1 wan2）"
+			echo "RivWRT: board.json 端口信息已更新（lan=lan1,lan3,lan4 / wan=wan1 / wan2=wan2）"
 		else
 			rm -f "$_bj_tmp"
 			echo "RivWRT: WARNING - board.json 校验未通过，保持原样" >&2
